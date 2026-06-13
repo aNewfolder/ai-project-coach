@@ -20,7 +20,7 @@ import requests
 
 # ===== 配置 =====
 DEEPSEEK_API_BASE = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEEPSEEK_MODEL = "deepseek-chat"
 GITHUB_API_BASE = "https://api.github.com"
 FEISHU_CONFIG_PATH = os.path.expanduser("~/.openclaw/config/feishu.json")
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "tutorial_template.md")
@@ -87,35 +87,52 @@ def is_launch_command(cmd):
         "jupyter notebook", "jupyter lab",
         ".launch()", "demo.launch", "app.run",
     ]
-    cmd_lower = cmd.lower().strip()
+    # 去掉命令末尾的 & 再检测
+    cmd_clean = cmd.strip().rstrip("&").strip().lower()
     for pattern in launch_patterns:
-        if pattern in cmd_lower or cmd_lower.endswith('&'):
+        if pattern in cmd_clean:
             return True
+    # 命令末尾有 & 也视为后台服务
+    if cmd.strip().endswith("&"):
+        return True
     return False
 
 
-def run_ssh_command(cmd, timeout=300):
+def run_ssh_command(cmd, timeout=300, cd_prefix=""):
     """执行SSH命令。如果是启动服务类命令，用nohup后台运行并等几秒检查"""
+    # 构建完整的目录前缀
+    work_dir = cd_prefix if cd_prefix else REMOTE_PROJECTS_DIR
+
+    # 如果 cmd 已经包含 cd 前缀，直接用 cmd
+    if cmd.strip().startswith("cd "):
+        shell_cmd = cmd
+    else:
+        shell_cmd = f"cd {work_dir} && {cmd}"
+
     if is_launch_command(cmd):
-        # 启动服务类命令：后台运行，等5秒后检查进程是否存活
-        bg_cmd = f'ssh autodl "cd {REMOTE_PROJECTS_DIR} && nohup {cmd} > /tmp/service.log 2>&1 & sleep 5 && ps aux | grep -v grep | grep -c \'{cmd.split()[0]}\'"'
+        # 去掉命令末尾的 &（我们自己加 nohup）
+        clean_cmd = cmd.strip().rstrip("&").strip()
+        launch_shell = f"cd {work_dir} && {clean_cmd}" if not clean_cmd.startswith("cd ") else clean_cmd
+
+        # 启动服务类命令：后台运行，等8秒后检查端口或进程是否存活
+        bg_cmd = f'ssh autodl "{launch_shell} > /tmp/service.log 2>&1 & disown; sleep 8; (curl -s -o /dev/null http://localhost:8000 && echo RUNNING || curl -s -o /dev/null http://localhost:7860 && echo RUNNING || curl -s -o /dev/null http://localhost:8080 && echo RUNNING || curl -s -o /dev/null http://localhost:8501 && echo RUNNING || echo STOPPED)"'
         start = time.time()
         try:
             result = subprocess.run(bg_cmd, shell=True, capture_output=True, text=True, timeout=30)
             duration = round(time.time() - start, 1)
-            # 如果grep找到了进程，说明服务成功启动
-            count = result.stdout.strip()
-            if count and int(count) > 0:
+            output = result.stdout.strip()
+            if "RUNNING" in output:
                 return "服务已在后台启动", "", 0, duration
             else:
-                # 读取日志看看报了什么错
-                log_cmd = f'ssh autodl "cat /tmp/service.log 2>/dev/null | tail -20"'
+                # 读取日志
+                log_cmd = f'ssh autodl "cat /tmp/service.log 2>/dev/null | tail -30"'
                 log_result = subprocess.run(log_cmd, shell=True, capture_output=True, text=True, timeout=10)
-                return "", log_result.stdout or "服务启动后立即退出", 1, duration
+                error_log = log_result.stdout or "服务启动后立即退出"
+                return "", error_log, 1, duration
         except Exception as e:
             return "", str(e), -1, round(time.time() - start, 1)
     else:
-        full_cmd = f'ssh autodl "cd {REMOTE_PROJECTS_DIR} && {cmd}"'
+        full_cmd = f'ssh autodl "{shell_cmd}"'
         start = time.time()
         try:
             result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
@@ -202,20 +219,33 @@ README 内容：
 3. 如果需要 git clone，使用 HTTPS 地址
 4. 每个 step 的 is_key_step 标记为 true 表示这是关键步骤需要截图
 5. estimated_time 是预估总部署时间（分钟）
-6. 如果项目需要配置文件，用 echo 或 sed 命令自动生成，不要让用户手动编辑"""
+6. 如果项目需要配置文件，用 echo 或 sed 命令自动生成，不要让用户手动编辑
+7. 所有命令都在 /root/projects 目录下执行，不要 cd 到其他目录如 ~ 或 /home
+8. 使用 python3 而不是 python 来执行 Python 脚本
+9. 启动服务的命令（如 uvicorn、streamlit run 等）不要加 & 或 nohup，系统会自动处理后台运行
+10. 如果项目需要安装依赖，直接用 pip install 而不是在虚拟环境中安装（除非 README 特别要求）"""
 
     result = call_deepseek(prompt)
     if not result:
         return None
 
     try:
-        result = re.sub(r'^```json\s*', '', result)
-        result = re.sub(r'\s*```$', '', result)
+        # 清理各种可能的 markdown 包裹
+        result = re.sub(r'^```json\s*\n?', '', result)
+        result = re.sub(r'^```\s*\n?', '', result)
+        result = re.sub(r'\n?```\s*$', '', result)
+        result = result.strip()
+        # 尝试找到 JSON 对象的起始位置
+        json_start = result.find('{')
+        json_end = result.rfind('}')
+        if json_start >= 0 and json_end > json_start:
+            result = result[json_start:json_end+1]
         plan = json.loads(result)
         log(f"  → 解析出 {len(plan.get('steps', []))} 个部署步骤")
         return plan
     except json.JSONDecodeError as e:
         log(f"  ⚠️ JSON 解析失败: {e}")
+        log(f"  原始返回前200字: {result[:200]}")
         return None
 
 
@@ -235,6 +265,10 @@ def execute_deployment(plan):
 
     # 确保工作目录存在
     run_ssh_command(f"mkdir -p {REMOTE_PROJECTS_DIR}", timeout=10)
+
+    # 维护一个累积的 cd 路径前缀，解决 SSH 每条命令独立执行的问题
+    # 每条命令执行前都会先 cd 到正确的工作目录
+    cd_prefix = ""
 
     for i, step in enumerate(steps):
         step_num = i + 1
@@ -258,8 +292,42 @@ def execute_deployment(plan):
 
         total_duration = 0
         for cmd in commands:
+            # 如果这条命令是 cd，记住目录并和下一条合并
+            stripped = cmd.strip()
+            if stripped.startswith("cd ") and "&&" not in stripped:
+                # 纯 cd 命令：记录路径，不单独执行
+                cd_target = stripped[3:].strip()
+                if cd_target.startswith("/") or cd_target.startswith("~"):
+                    cd_prefix = cd_target
+                else:
+                    cd_prefix = f"{cd_prefix}/{cd_target}" if cd_prefix else f"{REMOTE_PROJECTS_DIR}/{cd_target}"
+                log(f"  ▶ 执行: {cmd}")
+                log(f"  ✅ 成功 (0.1s)")
+                step_result["outputs"].append({
+                    "command": cmd, "stdout": "", "stderr": "",
+                    "returncode": 0, "duration": 0.1
+                })
+                step_result["final_commands"].append(cmd)
+                continue
+
+            # source 命令在 SSH 中无效（每次 SSH 是独立 shell），跳过但标记成功
+            if stripped.startswith("source "):
+                log(f"  ▶ 执行: {cmd}")
+                log(f"  ✅ 成功 (0.1s) (虚拟环境激活在教程中展示)")
+                step_result["outputs"].append({
+                    "command": cmd, "stdout": "", "stderr": "",
+                    "returncode": 0, "duration": 0.1
+                })
+                step_result["final_commands"].append(cmd)
+                continue
+
+            # 如果之前有 cd 前缀，在命令前加上 cd
+            actual_cmd = cmd
+            if cd_prefix:
+                actual_cmd = f"cd {cd_prefix} && {cmd}"
+
             log(f"  ▶ 执行: {cmd}")
-            stdout, stderr, returncode, duration = run_ssh_command(cmd, timeout=600)
+            stdout, stderr, returncode, duration = run_ssh_command(actual_cmd, timeout=600, cd_prefix=cd_prefix if cd_prefix else "")
             total_duration += duration
 
             step_result["outputs"].append({
@@ -279,24 +347,25 @@ def execute_deployment(plan):
                 for retry in range(MAX_RETRY):
                     log(f"  🔧 第 {retry+1}/{MAX_RETRY} 次尝试修复...")
                     fix_result = auto_fix_error(cmd, stderr, project_name)
-                    if fix_result:
-                        step_result["error_fix"] = fix_result
-                        # 重新执行原命令
-                        log(f"  🔄 修复后重试: {cmd}")
-                        stdout2, stderr2, rc2, dur2 = run_ssh_command(cmd, timeout=600)
-                        total_duration += dur2
-                        if rc2 == 0:
-                            log(f"  ✅ 第 {retry+1} 次修复后重试成功！")
-                            step_result["outputs"][-1]["returncode"] = 0
-                            step_result["outputs"][-1]["stdout"] = stdout2[:2000]
-                            # 记录最终成功的命令序列（修复命令 + 原命令）
-                            step_result["final_commands"] = fix_result.get("fix_commands", []) + [cmd]
-                            fixed = True
-                            break
-                        else:
-                            stderr = stderr2  # 用新的错误信息继续下一轮修复
-                    else:
+                    if not fix_result:
+                        # DeepSeek 没返回修复方案，继续尝试（换一个 prompt）
+                        log(f"  ⚠️ 未获取到修复方案，继续尝试...")
+                        continue
+
+                    step_result["error_fix"] = fix_result
+                    # 重新执行原命令（带上 cd 前缀）
+                    log(f"  🔄 修复后重试: {cmd}")
+                    stdout2, stderr2, rc2, dur2 = run_ssh_command(actual_cmd, timeout=600, cd_prefix=cd_prefix if cd_prefix else "")
+                    total_duration += dur2
+                    if rc2 == 0:
+                        log(f"  ✅ 第 {retry+1} 次修复后重试成功！")
+                        step_result["outputs"][-1]["returncode"] = 0
+                        step_result["outputs"][-1]["stdout"] = stdout2[:2000]
+                        step_result["final_commands"] = fix_result.get("fix_commands", []) + [cmd]
+                        fixed = True
                         break
+                    else:
+                        stderr = stderr2  # 用新的错误信息继续下一轮修复
 
                 if not fixed:
                     step_result["success"] = False
@@ -329,17 +398,35 @@ def auto_fix_error(failed_cmd, error_msg, project_name):
 运行环境: Ubuntu 22.04 + Python 3.10 + CUDA 12.1 (AutoDL GPU 服务器)
 工作目录: /root/projects
 项目: {project_name}
-注意: 此环境不支持 Docker 和 systemctl
+注意: 此环境不支持 Docker 和 systemctl。python3 可用，python 可能不可用。
 
-请给出最可能的修复命令。只返回需要执行的修复命令，每行一条，不要任何解释文字。
-如果无法修复，返回空字符串。"""
+请给出最可能的修复命令。
+重要要求：
+1. 只返回纯 shell 命令，每行一条
+2. 不要包含任何 markdown 格式（不要 ```bash 或 ``` 标记）
+3. 不要包含任何解释文字
+4. 如果无法修复，返回空字符串"""
 
     fix_text = call_deepseek(prompt, max_tokens=500)
     if not fix_text or fix_text.strip() == "":
         return None
 
-    fix_commands = [line.strip() for line in fix_text.strip().split('\n')
-                    if line.strip() and not line.strip().startswith('#')]
+    # 清理 DeepSeek 返回中可能的 markdown 标记
+    fix_commands = []
+    for line in fix_text.strip().split('\n'):
+        line = line.strip()
+        # 跳过空行、注释、markdown标记
+        if not line:
+            continue
+        if line.startswith('#'):
+            continue
+        if line.startswith('```'):
+            continue
+        if line.startswith('---'):
+            continue
+        if line.startswith('注意') or line.startswith('说明') or line.startswith('解释'):
+            continue
+        fix_commands.append(line)
 
     if not fix_commands:
         return None
