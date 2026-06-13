@@ -20,7 +20,7 @@ import requests
 
 # ===== 配置 =====
 DEEPSEEK_API_BASE = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-v4-pro"
 GITHUB_API_BASE = "https://api.github.com"
 FEISHU_CONFIG_PATH = os.path.expanduser("~/.openclaw/config/feishu.json")
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "tutorial_template.md")
@@ -89,7 +89,7 @@ def is_launch_command(cmd):
     ]
     cmd_lower = cmd.lower().strip()
     for pattern in launch_patterns:
-        if pattern in cmd_lower:
+        if pattern in cmd_lower or cmd_lower.endswith('&'):
             return True
     return False
 
