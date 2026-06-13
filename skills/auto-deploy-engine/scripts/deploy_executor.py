@@ -76,17 +76,55 @@ def call_deepseek(prompt, max_tokens=4000):
         return ""
 
 
+def is_launch_command(cmd):
+    """判断命令是否是启动服务类命令（会一直运行不退出）"""
+    launch_patterns = [
+        "python app.py", "python3 app.py", "python main.py", "python3 main.py",
+        "python run.py", "python3 run.py", "python server.py", "python3 server.py",
+        "python manage.py runserver", "python3 manage.py runserver",
+        "streamlit run", "gradio ", "uvicorn ", "gunicorn ", "flask run",
+        "npm start", "npm run dev", "npm run serve", "node server",
+        "jupyter notebook", "jupyter lab",
+        ".launch()", "demo.launch", "app.run",
+    ]
+    cmd_lower = cmd.lower().strip()
+    for pattern in launch_patterns:
+        if pattern in cmd_lower:
+            return True
+    return False
+
+
 def run_ssh_command(cmd, timeout=300):
-    full_cmd = f'ssh autodl "cd {REMOTE_PROJECTS_DIR} && {cmd}"'
-    start = time.time()
-    try:
-        result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-        duration = round(time.time() - start, 1)
-        return result.stdout, result.stderr, result.returncode, duration
-    except subprocess.TimeoutExpired:
-        return "", "命令超时", -1, round(time.time() - start, 1)
-    except Exception as e:
-        return "", str(e), -1, round(time.time() - start, 1)
+    """执行SSH命令。如果是启动服务类命令，用nohup后台运行并等几秒检查"""
+    if is_launch_command(cmd):
+        # 启动服务类命令：后台运行，等5秒后检查进程是否存活
+        bg_cmd = f'ssh autodl "cd {REMOTE_PROJECTS_DIR} && nohup {cmd} > /tmp/service.log 2>&1 & sleep 5 && ps aux | grep -v grep | grep -c \'{cmd.split()[0]}\'"'
+        start = time.time()
+        try:
+            result = subprocess.run(bg_cmd, shell=True, capture_output=True, text=True, timeout=30)
+            duration = round(time.time() - start, 1)
+            # 如果grep找到了进程，说明服务成功启动
+            count = result.stdout.strip()
+            if count and int(count) > 0:
+                return "服务已在后台启动", "", 0, duration
+            else:
+                # 读取日志看看报了什么错
+                log_cmd = f'ssh autodl "cat /tmp/service.log 2>/dev/null | tail -20"'
+                log_result = subprocess.run(log_cmd, shell=True, capture_output=True, text=True, timeout=10)
+                return "", log_result.stdout or "服务启动后立即退出", 1, duration
+        except Exception as e:
+            return "", str(e), -1, round(time.time() - start, 1)
+    else:
+        full_cmd = f'ssh autodl "cd {REMOTE_PROJECTS_DIR} && {cmd}"'
+        start = time.time()
+        try:
+            result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            duration = round(time.time() - start, 1)
+            return result.stdout, result.stderr, result.returncode, duration
+        except subprocess.TimeoutExpired:
+            return "", "命令超时", -1, round(time.time() - start, 1)
+        except Exception as e:
+            return "", str(e), -1, round(time.time() - start, 1)
 
 
 def take_screenshot(cmd_desc, step_num, project_name):
@@ -349,25 +387,31 @@ def verify_deployment(plan):
 def generate_explanation(cmd):
     """为命令生成通俗解释"""
     quick = {
-        "git clone": "从 GitHub 下载项目的完整代码到服务器上",
-        "cd ": "进入指定的文件夹",
-        "pip install": "安装项目所需的 Python 依赖包",
-        "pip3 install": "安装项目所需的 Python 依赖包",
-        "apt-get install": "安装系统级的软件包",
-        "apt install": "安装系统级的软件包",
-        "wget": "从网上下载文件",
-        "curl": "从网上获取数据或下载文件",
-        "chmod": "修改文件的执行权限",
-        "mkdir": "创建一个新文件夹",
-        "cp ": "复制文件",
-        "mv ": "移动或重命名文件",
-        "python": "运行 Python 脚本",
-        "npm install": "安装 Node.js 依赖包",
-        "export": "设置环境变量（告诉系统一些配置信息）",
-        "echo ": "输出一段文字或写入文件",
-        "sed ": "自动修改文件中的内容",
-        "cat ": "查看或合并文件内容",
+        "git clone": "把这个项目的所有文件从网上下载到你的电脑里",
+        "cd ": "进入刚才下载好的文件夹",
+        "pip install": "自动安装这个项目运行所需要的所有工具包（就像安装 App 的依赖一样）",
+        "pip3 install": "自动安装这个项目运行所需要的所有工具包",
+        "apt-get install": "安装系统需要的基础软件（类似给电脑装驱动）",
+        "apt install": "安装系统需要的基础软件",
+        "apt update": "让系统检查一下有没有软件更新",
+        "wget": "从网上下载一个文件到你的电脑",
+        "curl": "从网上获取数据",
+        "chmod": "给文件加上「可以运行」的权限",
+        "mkdir": "创建一个新的文件夹",
+        "cp ": "把文件复制一份",
+        "mv ": "把文件移动到另一个位置（或者改名）",
+        "python": "运行项目的主程序",
+        "python3": "运行项目的主程序",
+        "npm install": "安装前端项目需要的工具包",
+        "export": "设置一个配置信息（比如告诉程序你的密码放在哪里）",
+        "echo ": "往文件里写入一些内容，或者在屏幕上显示一段文字",
+        "sed ": "自动修改文件里的某些内容（不用你手动打开编辑）",
+        "cat >": "创建一个新文件并往里面写入内容",
+        "cat ": "查看文件的内容",
         "rm ": "删除文件或文件夹",
+        "source ": "激活一个虚拟环境（让后面的命令在独立空间里运行）",
+        "venv": "创建一个独立的 Python 运行环境（不会影响系统里其他程序）",
+        "nohup": "让程序在后台持续运行（关掉终端也不会停）",
     }
     for key, expl in quick.items():
         if key in cmd:
@@ -420,17 +464,17 @@ def generate_tutorial(plan, deploy_results, verify_result):
 
         for cmd in final_cmds:
             explanation = generate_explanation(cmd)
-            step_md += f"在终端中输入以下命令并回车：\n\n"
+            step_md += f"复制下面的命令，粘贴到终端窗口中，然后按回车键执行：\n\n"
             step_md += f"```bash\n{cmd}\n```\n\n"
-            step_md += f"> 🔍 **这条命令在做什么：** {explanation}\n\n"
+            step_md += f"> 💡 **这一步在干嘛：** {explanation}\n\n"
 
         # 截图
         screenshot_file = f"step_{result['step_num']:02d}.png"
         if os.path.exists(os.path.join(screenshots_dir, screenshot_file)):
-            step_md += f"执行成功后你会看到类似这样的界面：\n\n"
+            step_md += f"✅ 如果一切顺利，你的终端会显示类似下图的内容（不需要完全一样，只要没有红色的 Error 报错就行）：\n\n"
             step_md += f"![步骤{display_num}截图](./screenshots/{screenshot_file})\n\n"
 
-        step_md += f"⏱️ 这一步大约需要 {result['duration']}s\n\n---\n\n"
+        step_md += f"⏱️ 预计耗时约 {max(1, int(result['duration']))} 秒\n\n---\n\n"
         success_md.append(step_md)
 
     # ===== 生成失败附录 =====
