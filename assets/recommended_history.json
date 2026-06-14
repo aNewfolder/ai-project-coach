@@ -1,0 +1,9 @@
+{
+  "recommended": [
+    "ollama/ollama",
+    "AUTOMATIC1111/stable-diffusion-webui",
+    "browser-use/browser-use",
+    "infiniflow/ragflow",
+    "vllm-project/vllm"
+  ]
+}
