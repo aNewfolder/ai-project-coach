@@ -1,0 +1,14 @@
+{
+  "recommended": [
+    "ollama/ollama",
+    "AUTOMATIC1111/stable-diffusion-webui",
+    "browser-use/browser-use",
+    "infiniflow/ragflow",
+    "vllm-project/vllm",
+    "n8n-io/n8n",
+    "open-webui/open-webui",
+    "Shubhamsaboo/awesome-llm-apps",
+    "harry0703/MoneyPrinterTurbo",
+    "TauricResearch/TradingAgents"
+  ]
+}

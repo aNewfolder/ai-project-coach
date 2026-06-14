@@ -454,7 +454,10 @@ def verify_deployment(plan):
         log("⚠️ 没有验证命令，跳过验证")
         return {"success": None, "method": method, "output": "无验证命令"}
 
+    # 等待服务完全启动
     log(f"🔍 验证部署: {method}")
+    log(f"  ⏳ 等待服务完全启动...")
+    import time as _t; _t.sleep(10)
     log(f"  ▶ 执行: {cmd}")
     stdout, stderr, rc, dur = run_ssh_command(cmd, timeout=60)
 
