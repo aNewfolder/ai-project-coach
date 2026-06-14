@@ -99,37 +99,55 @@ def is_launch_command(cmd):
 
 
 def run_ssh_command(cmd, timeout=300, cd_prefix=""):
-    """执行SSH命令，智能处理不同类型的命令"""
+    """
+    通过 SSH 在 AutoDL 上执行命令。
+    所有命令通过 stdin 管道传递给远程 bash，彻底避免引号转义问题。
+    """
     work_dir = cd_prefix if cd_prefix else REMOTE_PROJECTS_DIR
 
-    # 判断是否是写文件的命令（cat > ... << EOF 或 echo '...' > file）
-    is_heredoc = "<<" in cmd and ("cat >" in cmd or "cat>" in cmd)
-
     if is_launch_command(cmd):
+        # 启动服务类命令：后台运行，等8秒后检查端口
         clean_cmd = cmd.strip().rstrip("&").strip()
-        if clean_cmd.startswith("cd "):
-            launch_shell = clean_cmd
-        else:
-            launch_shell = f"cd {work_dir} && {clean_cmd}"
-
-        bg_cmd = f'ssh autodl "{launch_shell} > /tmp/service.log 2>&1 & disown; sleep 8; (curl -s -o /dev/null http://localhost:8000 && echo RUNNING || curl -s -o /dev/null http://localhost:7860 && echo RUNNING || curl -s -o /dev/null http://localhost:8080 && echo RUNNING || curl -s -o /dev/null http://localhost:8501 && echo RUNNING || echo STOPPED)"'
+        script = f"""cd {work_dir}
+{clean_cmd} > /tmp/service.log 2>&1 &
+disown
+sleep 8
+if curl -s -o /dev/null http://localhost:8000 2>/dev/null; then echo RUNNING
+elif curl -s -o /dev/null http://localhost:7860 2>/dev/null; then echo RUNNING
+elif curl -s -o /dev/null http://localhost:8080 2>/dev/null; then echo RUNNING
+elif curl -s -o /dev/null http://localhost:8501 2>/dev/null; then echo RUNNING
+elif curl -s -o /dev/null http://localhost:5000 2>/dev/null; then echo RUNNING
+else echo STOPPED
+fi
+"""
         start = time.time()
         try:
-            result = subprocess.run(bg_cmd, shell=True, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                ["ssh", "autodl", "bash", "-s"],
+                input=script, capture_output=True, text=True, timeout=30
+            )
             duration = round(time.time() - start, 1)
-            if "RUNNING" in result.stdout.strip():
+            if "RUNNING" in result.stdout:
                 return "服务已在后台启动", "", 0, duration
             else:
-                log_cmd = f'ssh autodl "cat /tmp/service.log 2>/dev/null | tail -30"'
-                log_result = subprocess.run(log_cmd, shell=True, capture_output=True, text=True, timeout=10)
+                log_result = subprocess.run(
+                    ["ssh", "autodl", "bash", "-s"],
+                    input="cat /tmp/service.log 2>/dev/null | tail -30",
+                    capture_output=True, text=True, timeout=10
+                )
                 return "", log_result.stdout or "服务启动后立即退出", 1, duration
         except Exception as e:
             return "", str(e), -1, round(time.time() - start, 1)
+    else:
+        # 普通命令：通过 stdin 传递，彻底避免引号问题
+        if cmd.strip().startswith("cd ") and "&&" in cmd:
+            # 已经包含 cd 的复合命令，直接执行
+            script = cmd
+        elif cmd.strip().startswith("cd "):
+            script = cmd
+        else:
+            script = f"cd {work_dir}\n{cmd}"
 
-    elif is_heredoc:
-        # 写文件的命令：通过 stdin 管道传递，避免引号转义问题
-        # 构建完整的脚本：先 cd 到工作目录，再执行 cat 命令
-        script = f"cd {work_dir}\n{cmd}"
         start = time.time()
         try:
             result = subprocess.run(
@@ -143,32 +161,23 @@ def run_ssh_command(cmd, timeout=300, cd_prefix=""):
         except Exception as e:
             return "", str(e), -1, round(time.time() - start, 1)
 
-    else:
-        # 普通命令
-        if cmd.strip().startswith("cd "):
-            shell_cmd = cmd
-        else:
-            shell_cmd = f"cd {work_dir} && {cmd}"
-
-        full_cmd = f'ssh autodl "{shell_cmd}"'
-        start = time.time()
-        try:
-            result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-            duration = round(time.time() - start, 1)
-            return result.stdout, result.stderr, result.returncode, duration
-        except subprocess.TimeoutExpired:
-            return "", "命令超时", -1, round(time.time() - start, 1)
-        except Exception as e:
-            return "", str(e), -1, round(time.time() - start, 1)
-
 
 def take_screenshot(cmd_desc, step_num, project_name):
     remote_path = f"{REMOTE_SCREENSHOTS_DIR}/{project_name}/step_{step_num:02d}.png"
-    ssh_cmd = f'ssh autodl "mkdir -p {REMOTE_SCREENSHOTS_DIR}/{project_name} && bash {REMOTE_SCREENSHOT_SCRIPT} \'echo {cmd_desc}\' \'{remote_path}\' \'步骤 {step_num}: {cmd_desc[:30]}\'"'
+    # 使用 stdin 管道避免引号问题
+    script = f"""mkdir -p {REMOTE_SCREENSHOTS_DIR}/{project_name}
+bash {REMOTE_SCREENSHOT_SCRIPT} 'echo {cmd_desc}' '{remote_path}' '步骤 {step_num}: {cmd_desc[:30]}'
+"""
     try:
-        subprocess.run(ssh_cmd, shell=True, capture_output=True, timeout=30)
-        check = subprocess.run(f'ssh autodl "test -f {remote_path} && echo OK"',
-                               shell=True, capture_output=True, text=True, timeout=10)
+        subprocess.run(
+            ["ssh", "autodl", "bash", "-s"],
+            input=script, capture_output=True, text=True, timeout=30
+        )
+        check = subprocess.run(
+            ["ssh", "autodl", "bash", "-s"],
+            input=f"test -f {remote_path} && echo OK",
+            capture_output=True, text=True, timeout=10
+        )
         if "OK" in check.stdout:
             return remote_path
     except:
@@ -273,10 +282,20 @@ README 内容：
 # ===== 第二阶段：执行部署 =====
 
 def cleanup_old_project(project_name):
-    """清理 AutoDL 上的旧项目目录"""
+    """清理 AutoDL 上的旧项目目录和残留进程"""
     log(f"🧹 清理旧项目目录: {project_name}")
     run_ssh_command(f"rm -rf {REMOTE_PROJECTS_DIR}/{project_name}", timeout=30)
     run_ssh_command(f"rm -rf {REMOTE_SCREENSHOTS_DIR}/{project_name}", timeout=10)
+    # 杀掉可能占用端口的旧进程
+    kill_script = """
+for port in 8000 7860 8080 8501 5000; do
+    pid=$(lsof -ti :$port 2>/dev/null)
+    if [ -n "$pid" ]; then
+        kill -9 $pid 2>/dev/null
+    fi
+done
+"""
+    run_ssh_command(kill_script, timeout=10)
 
 
 def execute_deployment(plan):
@@ -479,6 +498,8 @@ def verify_deployment(plan):
         return {"success": None, "method": method, "output": "无验证命令"}
 
     log(f"🔍 验证部署: {method}")
+    log(f"  ⏳ 等待服务完全启动...")
+    time.sleep(10)
     log(f"  ▶ 执行: {cmd}")
     stdout, stderr, rc, dur = run_ssh_command(cmd, timeout=60)
 
@@ -686,7 +707,7 @@ def git_push_tutorial(project_name):
             "cd ~/ai-project-coach && git push"
         ]
         for cmd in cmds:
-            subprocess.run(cmd, shell=True, capture_output=True, timeout=30)
+            subprocess.run(cmd, shell=True, capture_output=True, timeout=120)
         github_link = f"https://github.com/aNewfolder/ai-project-coach/tree/main/tutorials/{project_name}"
         log(f"  → ✅ 已推送，链接: {github_link}")
         return github_link
