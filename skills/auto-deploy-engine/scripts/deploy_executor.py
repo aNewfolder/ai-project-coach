@@ -99,39 +99,57 @@ def is_launch_command(cmd):
 
 
 def run_ssh_command(cmd, timeout=300, cd_prefix=""):
-    """执行SSH命令。如果是启动服务类命令，用nohup后台运行并等几秒检查"""
-    # 构建完整的目录前缀
+    """执行SSH命令，智能处理不同类型的命令"""
     work_dir = cd_prefix if cd_prefix else REMOTE_PROJECTS_DIR
 
-    # 如果 cmd 已经包含 cd 前缀，直接用 cmd
-    if cmd.strip().startswith("cd "):
-        shell_cmd = cmd
-    else:
-        shell_cmd = f"cd {work_dir} && {cmd}"
+    # 判断是否是写文件的命令（cat > ... << EOF 或 echo '...' > file）
+    is_heredoc = "<<" in cmd and ("cat >" in cmd or "cat>" in cmd)
 
     if is_launch_command(cmd):
-        # 去掉命令末尾的 &（我们自己加 nohup）
         clean_cmd = cmd.strip().rstrip("&").strip()
-        launch_shell = f"cd {work_dir} && {clean_cmd}" if not clean_cmd.startswith("cd ") else clean_cmd
+        if clean_cmd.startswith("cd "):
+            launch_shell = clean_cmd
+        else:
+            launch_shell = f"cd {work_dir} && {clean_cmd}"
 
-        # 启动服务类命令：后台运行，等8秒后检查端口或进程是否存活
         bg_cmd = f'ssh autodl "{launch_shell} > /tmp/service.log 2>&1 & disown; sleep 8; (curl -s -o /dev/null http://localhost:8000 && echo RUNNING || curl -s -o /dev/null http://localhost:7860 && echo RUNNING || curl -s -o /dev/null http://localhost:8080 && echo RUNNING || curl -s -o /dev/null http://localhost:8501 && echo RUNNING || echo STOPPED)"'
         start = time.time()
         try:
             result = subprocess.run(bg_cmd, shell=True, capture_output=True, text=True, timeout=30)
             duration = round(time.time() - start, 1)
-            output = result.stdout.strip()
-            if "RUNNING" in output:
+            if "RUNNING" in result.stdout.strip():
                 return "服务已在后台启动", "", 0, duration
             else:
-                # 读取日志
                 log_cmd = f'ssh autodl "cat /tmp/service.log 2>/dev/null | tail -30"'
                 log_result = subprocess.run(log_cmd, shell=True, capture_output=True, text=True, timeout=10)
-                error_log = log_result.stdout or "服务启动后立即退出"
-                return "", error_log, 1, duration
+                return "", log_result.stdout or "服务启动后立即退出", 1, duration
         except Exception as e:
             return "", str(e), -1, round(time.time() - start, 1)
+
+    elif is_heredoc:
+        # 写文件的命令：通过 stdin 管道传递，避免引号转义问题
+        # 构建完整的脚本：先 cd 到工作目录，再执行 cat 命令
+        script = f"cd {work_dir}\n{cmd}"
+        start = time.time()
+        try:
+            result = subprocess.run(
+                ["ssh", "autodl", "bash", "-s"],
+                input=script, capture_output=True, text=True, timeout=timeout
+            )
+            duration = round(time.time() - start, 1)
+            return result.stdout, result.stderr, result.returncode, duration
+        except subprocess.TimeoutExpired:
+            return "", "命令超时", -1, round(time.time() - start, 1)
+        except Exception as e:
+            return "", str(e), -1, round(time.time() - start, 1)
+
     else:
+        # 普通命令
+        if cmd.strip().startswith("cd "):
+            shell_cmd = cmd
+        else:
+            shell_cmd = f"cd {work_dir} && {cmd}"
+
         full_cmd = f'ssh autodl "{shell_cmd}"'
         start = time.time()
         try:
@@ -219,11 +237,14 @@ README 内容：
 3. 如果需要 git clone，使用 HTTPS 地址
 4. 每个 step 的 is_key_step 标记为 true 表示这是关键步骤需要截图
 5. estimated_time 是预估总部署时间（分钟）
-6. 如果项目需要配置文件，用 echo 或 sed 命令自动生成，不要让用户手动编辑
-7. 所有命令都在 /root/projects 目录下执行，不要 cd 到其他目录如 ~ 或 /home
+6. 如果项目需要配置文件，用 cat > filename << 'EOF' 方式创建，不要让用户手动编辑
+7. 所有命令都在 /root/projects 目录下执行，不要 cd 到 ~ 或 /home
 8. 使用 python3 而不是 python 来执行 Python 脚本
-9. 启动服务的命令（如 uvicorn、streamlit run 等）不要加 & 或 nohup，系统会自动处理后台运行
-10. 如果项目需要安装依赖，直接用 pip install 而不是在虚拟环境中安装（除非 README 特别要求）"""
+9. 启动服务的命令（如 uvicorn、streamlit run 等）不要加 & 或 nohup
+10. 直接用 pip install 安装依赖，不需要创建虚拟环境
+11. 如果项目需要外部 API Key（如 OpenAI Key）才能运行核心功能，测试脚本不要调用需要 Key 的功能，只验证 import 是否成功即可。验证命令写成: python3 -c "import 模块名; print('安装成功')"
+12. 写入文件时用 cat > filepath << 'EOF' 格式，EOF 前面的引号不要省略（防止变量替换）
+13. 验证命令要简单可靠，优先用 curl localhost:端口 或 python3 -c "import xxx; print('OK')"，不要写复杂的测试脚本"""
 
     result = call_deepseek(prompt)
     if not result:
@@ -435,12 +456,15 @@ def auto_fix_error(failed_cmd, error_msg, project_name):
     fix_outputs = []
     for fix_cmd in fix_commands[:10]:
         log(f"  ▶ 修复: {fix_cmd}")
+        # 修复命令也需要在正确的工作目录执行
         stdout, stderr, rc, dur = run_ssh_command(fix_cmd, timeout=300)
         fix_outputs.append({"command": fix_cmd, "returncode": rc})
         if rc != 0:
-            log(f"  ⚠️ 修复命令失败: {fix_cmd}")
+            log(f"  ⚠️ 修复命令失败: {fix_cmd[:80]}")
 
-    return {"fix_commands": fix_commands, "fix_outputs": fix_outputs}
+    return {"fix_commands": [c for c in fix_commands if not any(
+        c.startswith(skip) for skip in ['注意', '说明', '解释', '原因', '分析']
+    )], "fix_outputs": fix_outputs}
 
 
 # ===== 第三阶段：验证 =====
@@ -454,10 +478,7 @@ def verify_deployment(plan):
         log("⚠️ 没有验证命令，跳过验证")
         return {"success": None, "method": method, "output": "无验证命令"}
 
-    # 等待服务完全启动
     log(f"🔍 验证部署: {method}")
-    log(f"  ⏳ 等待服务完全启动...")
-    import time as _t; _t.sleep(10)
     log(f"  ▶ 执行: {cmd}")
     stdout, stderr, rc, dur = run_ssh_command(cmd, timeout=60)
 
